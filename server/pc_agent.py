@@ -62,10 +62,36 @@ async def handle_command(command: dict) -> str:
         query = params.get("query", "")
         if not query:
             return "缺少搜索关键词"
-        # 用百度搜索（国内稳定）
-        search_url = f"https://www.baidu.com/s?wd={query}"
-        webbrowser.open(search_url)
-        return f"已搜索: {query}"
+        # 后台搜索，抓取结果摘要返回，不弹浏览器
+        try:
+            import urllib.request
+            import urllib.parse
+            import re
+            search_url = f"https://www.baidu.com/s?wd={urllib.parse.quote(query)}"
+            req = urllib.request.Request(search_url, headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            })
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                html = resp.read().decode("utf-8", errors="ignore")
+            # 提取搜索结果摘要（简单正则提取）
+            abstracts = re.findall(r'<span class="content-right_[^"]*">(.*?)</span>', html)
+            if not abstracts:
+                abstracts = re.findall(r'<span class=".*?">(.*?)</span>', html)
+            # 清理 HTML 标签
+            results = []
+            for ab in abstracts[:3]:
+                clean = re.sub(r'<[^>]+>', '', ab).strip()
+                if len(clean) > 10:
+                    results.append(clean)
+            if results:
+                return f"搜索「{query}」的结果：\n" + "\n".join(f"{i+1}. {r}" for i, r in enumerate(results))
+            else:
+                # 兜底：打开浏览器让用户自己看
+                webbrowser.open(search_url)
+                return f"没有提取到摘要，已打开浏览器搜索：{query}"
+        except Exception as e:
+            webbrowser.open(f"https://www.baidu.com/s?wd={query}")
+            return f"后台搜索失败({e})，已打开浏览器"
 
     elif action == "open_file":
         path = params.get("path", "")
