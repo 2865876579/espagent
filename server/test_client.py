@@ -93,9 +93,14 @@ async def test_text_mode():
                 print("已连接！输入文字测试对话，输入 quit 退出\n")
 
                 while True:
-                    text = input("你: ")
+                    # input() 会阻塞事件循环，导致 WebSocket 不能及时响应 ping。
+                    # 放到线程里执行，连接空闲时仍能正常处理 keepalive。
+                    text = await asyncio.to_thread(input, "你: ")
+                    text = text.strip()
                     if text.lower() == "quit":
                         return
+                    if not text:
+                        continue
 
                     # 发送文字消息给服务端（type=text 会跳过 STT，直接送 LLM）
                     await ws.send(json.dumps({
