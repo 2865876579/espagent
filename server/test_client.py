@@ -22,43 +22,95 @@ import websockets
 import os
 
 
+async def recv_tts_stream(ws) -> None:
+    """接收服务端的流式 TTS 消息，直到 tts_audio_end。"""
+    audio_parts: list[bytes] = []
+    reply_text = ""
+
+    while True:
+        response = await asyncio.wait_for(ws.recv(), timeout=180)
+        data = json.loads(response)
+        msg_type = data.get("type")
+
+        if msg_type == "tts_audio_start":
+            reply_text = data.get("text", "")
+            print(f"AI: {reply_text}")
+
+        elif msg_type == "tts_audio_chunk":
+            audio_b64 = data.get("audio", "")
+            if audio_b64:
+                audio_parts.append(base64.b64decode(audio_b64))
+
+        elif msg_type == "tts_audio_end":
+            if not reply_text:
+                reply_text = data.get("text", "")
+                print(f"AI: {reply_text}")
+            if audio_parts:
+                audio_bytes = b"".join(audio_parts)
+                filename = "reply.mp3"
+                with open(filename, "wb") as f:
+                    f.write(audio_bytes)
+                print(f"[音频已保存到 {filename}，{len(audio_bytes)} bytes]\n")
+            else:
+                print("[TTS 未生成音频，但文字回复正常]\n")
+            return
+
+        # 兼容旧协议，方便回归测试。
+        elif msg_type == "tts_audio":
+            print(f"AI: {data.get('text')}")
+            audio_b64 = data.get("audio", "")
+            if audio_b64:
+                audio_bytes = base64.b64decode(audio_b64)
+                filename = "reply.mp3"
+                with open(filename, "wb") as f:
+                    f.write(audio_bytes)
+                print(f"[音频已保存到 {filename}，{len(audio_bytes)} bytes]\n")
+            else:
+                print("[TTS 未生成音频，但文字回复正常]\n")
+            return
+
+        elif msg_type == "stt_result":
+            print(f"[识别] {data.get('text')}")
+
+        elif msg_type == "status":
+            print(f"[状态] {data.get('msg')}\n")
+
+
 async def test_text_mode():
     """文字模式测试：跳过 STT，直接发文字给 LLM，收到 TTS 音频保存为 mp3"""
     # 连接地址，默认本地，可通过环境变量改为远程服务器
     uri = os.getenv("WS_URL", "ws://localhost:8000/ws/esp32")
-    print(f"连接到 {uri} ...")
 
-    async with websockets.connect(uri) as ws:
-        print("已连接！输入文字测试对话，输入 quit 退出\n")
+    while True:
+        try:
+            print(f"连接到 {uri} ...")
+            async with websockets.connect(
+                uri,
+                max_size=10 * 1024 * 1024,
+                ping_interval=30,
+                ping_timeout=120
+            ) as ws:
+                print("已连接！输入文字测试对话，输入 quit 退出\n")
 
-        while True:
-            text = input("你: ")
-            if text.lower() == "quit":
-                break
+                while True:
+                    text = input("你: ")
+                    if text.lower() == "quit":
+                        return
 
-            # 发送文字消息给服务端（type=text 会跳过 STT，直接送 LLM）
-            await ws.send(json.dumps({
-                "type": "text",
-                "text": text
-            }))
+                    # 发送文字消息给服务端（type=text 会跳过 STT，直接送 LLM）
+                    await ws.send(json.dumps({
+                        "type": "text",
+                        "text": text
+                    }, ensure_ascii=False))
 
-            # 等待服务端返回
-            response = await ws.recv()
-            data = json.loads(response)
+                    try:
+                        await recv_tts_stream(ws)
+                    except asyncio.TimeoutError:
+                        print("[超时] 服务端 180 秒没完成 TTS 回复\n")
 
-            if data.get("type") == "tts_audio":
-                # 收到 TTS 音频回复
-                print(f"AI: {data.get('text')}")
-                # 解码 base64 音频并保存为 mp3 文件
-                audio_bytes = base64.b64decode(data["audio"])
-                filename = "reply.mp3"
-                with open(filename, "wb") as f:
-                    f.write(audio_bytes)
-                print(f"[音频已保存到 {filename}，可以播放听效果]\n")
-
-            elif data.get("type") == "status":
-                # 收到状态提示（如"没听清"）
-                print(f"[状态] {data.get('msg')}\n")
+        except (ConnectionRefusedError, OSError, websockets.exceptions.ConnectionClosed) as e:
+            print(f"[断线] {e}，5秒后重连...")
+            await asyncio.sleep(5)
 
 
 if __name__ == "__main__":

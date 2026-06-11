@@ -39,4 +39,4 @@ TTS_VOICE = os.getenv("TTS_VOICE", "zh-CN-XiaoxiaoNeural")
 
 # ==================== 服务配置 ====================
 SERVER_HOST = os.getenv("SERVER_HOST", "0.0.0.0")  # 监听地址，0.0.0.0 表示所有网卡
-SERVER_PORT = int(os.getenv("SERVER_PORT", "8000"))  # 监听端口
+SERVER_PORT = int(os.getenv("SERVER_PORT", "8000"))  # 监听端口1

@@ -30,6 +30,89 @@ app = FastAPI(title="Smart Pillow Cloud Server")
 # 当 LLM 返回电脑控制命令时，会从这里取一个 Agent 转发命令
 pc_agents: dict[str, WebSocket] = {}
 
+# 存储已连接的 ESP32 客户端，PC Agent 回传结果时用于播报到设备。
+esp32_clients: dict[str, WebSocket] = {}
+esp32_send_locks: dict[str, asyncio.Lock] = {}
+last_active_esp32_id: str | None = None
+
+
+async def send_json_to_esp32(client_id: str, payload: dict) -> bool:
+    """串行发送一条 JSON 消息到指定 ESP32，避免多任务并发写同一 WebSocket。"""
+    websocket = esp32_clients.get(client_id)
+    lock = esp32_send_locks.get(client_id)
+    if websocket is None or lock is None:
+        return False
+
+    async with lock:
+        await websocket.send_text(json.dumps(payload, ensure_ascii=False))
+    return True
+
+
+async def send_tts_stream_to_esp32(client_id: str, text: str) -> bool:
+    """
+    把 TTS 音频流式发送到指定 ESP32。
+
+    协议：
+      - tts_audio_start：告知一次语音回复开始
+      - tts_audio_chunk：多条 MP3 音频块
+      - tts_audio_end：告知一次语音回复结束
+    """
+    websocket = esp32_clients.get(client_id)
+    lock = esp32_send_locks.get(client_id)
+    if websocket is None or lock is None:
+        return False
+
+    async with lock:
+        await websocket.send_text(json.dumps({
+            "type": "tts_audio_start",
+            "format": "mp3",
+            "text": text
+        }, ensure_ascii=False))
+
+        chunks = 0
+        async for audio_chunk in synthesize(text):
+            if not audio_chunk:
+                continue
+            chunks += 1
+            await websocket.send_text(json.dumps({
+                "type": "tts_audio_chunk",
+                "format": "mp3",
+                "seq": chunks,
+                "audio": base64.b64encode(audio_chunk).decode()
+            }, ensure_ascii=False))
+
+        await websocket.send_text(json.dumps({
+            "type": "tts_audio_end",
+            "format": "mp3",
+            "text": text,
+            "chunks": chunks
+        }, ensure_ascii=False))
+
+    return True
+
+
+async def send_pc_command(pc_command: dict, client_id: str) -> bool:
+    """把 LLM 产生的电脑控制命令转发给任意一个已连接的 PC Agent。"""
+    if not pc_agents:
+        return False
+
+    agent_ws = next(iter(pc_agents.values()))
+    await agent_ws.send_text(json.dumps({
+        "type": "pc_command",
+        "client_id": client_id,
+        "command": pc_command
+    }, ensure_ascii=False))
+    return True
+
+
+def pick_esp32_client(client_id: str | None = None) -> str | None:
+    """优先选择指定客户端，其次选择最近活跃客户端，最后选择任意在线 ESP32。"""
+    if client_id and client_id in esp32_clients:
+        return client_id
+    if last_active_esp32_id and last_active_esp32_id in esp32_clients:
+        return last_active_esp32_id
+    return next(iter(esp32_clients.keys()), None)
+
 
 @app.websocket("/ws/esp32")
 async def esp32_endpoint(websocket: WebSocket):
@@ -47,109 +130,118 @@ async def esp32_endpoint(websocket: WebSocket):
     3. {"type": "ping"} - 心跳保活
 
     返回消息类型：
-    - {"type": "tts_audio", "format": "mp3", "audio": "base64音频", "text": "回复文字"}
+    - {"type": "tts_audio_start", "format": "mp3", "text": "回复文字"}
+    - {"type": "tts_audio_chunk", "format": "mp3", "seq": 1, "audio": "base64音频块"}
+    - {"type": "tts_audio_end", "format": "mp3", "text": "回复文字", "chunks": 12}
     - {"type": "stt_result", "text": "识别出的文字"}
     - {"type": "status", "msg": "状态提示"}
     - {"type": "pong"}
     """
+    global last_active_esp32_id
+
     await websocket.accept()
-    print("[ESP32] 已连接")
+    client_id = str(id(websocket))
+    esp32_clients[client_id] = websocket
+    esp32_send_locks[client_id] = asyncio.Lock()
+    last_active_esp32_id = client_id
+    history: list[dict] = []
+    print(f"[ESP32] 已连接 ({client_id})")
 
     try:
         while True:
             # 等待 ESP32 发来的消息
             message = await websocket.receive_text()
             data = json.loads(message)
+            last_active_esp32_id = client_id
 
-            # ========== 文字模式（调试用，跳过 STT）==========
-            if data.get("type") == "text":
-                text = data["text"]
-                print(f"[Text] {text}")
+            try:
+                # ========== 文字模式（调试用，跳过 STT）==========
+                if data.get("type") == "text":
+                    text = data["text"]
+                    print(f"[Text] {text}")
 
-                # 送 LLM 获取回复和可能的电脑控制命令
-                result = await chat(text)
-                reply = result.get("reply", "")
-                pc_command = result.get("pc_command")
-                print(f"[LLM] reply={reply}, pc_cmd={pc_command}")
+                    result = await chat(text, history)
+                    reply = result.get("reply", "")
+                    pc_command = result.get("pc_command")
+                    print(f"[LLM] reply={reply}, pc_cmd={pc_command}")
 
-                # 如果 LLM 要求控制电脑，转发给 PC Agent
-                if pc_command and pc_agents:
-                    agent_ws = next(iter(pc_agents.values()))
-                    await agent_ws.send_text(json.dumps({
-                        "type": "pc_command",
-                        "command": pc_command
-                    }))
+                    if pc_command:
+                        sent = await send_pc_command(pc_command, client_id)
+                        if not sent:
+                            await send_json_to_esp32(client_id, {
+                                "type": "status",
+                                "msg": "没有在线 PC Agent，无法执行电脑控制命令"
+                            })
 
-                # 回复文字转语音，发回 ESP32 播放
-                if reply:
-                    audio_data = await synthesize(reply)
-                    audio_b64_out = base64.b64encode(audio_data).decode()
-                    await websocket.send_text(json.dumps({
-                        "type": "tts_audio",
-                        "format": "mp3",
-                        "audio": audio_b64_out,
-                        "text": reply
-                    }))
+                    if reply:
+                        await send_tts_stream_to_esp32(client_id, reply)
 
-            # ========== 语音模式（正式流程：STT -> LLM -> TTS）==========
-            elif data.get("type") == "audio":
-                # 解码 ESP32 上传的 base64 PCM 音频
-                audio_b64 = data["audio"]
-                audio_bytes = base64.b64decode(audio_b64)
+                # ========== 语音模式（正式流程：STT -> LLM -> TTS）==========
+                elif data.get("type") == "audio":
+                    audio_b64 = data["audio"]
+                    audio_bytes = base64.b64decode(audio_b64)
 
-                # 按 40ms 一帧切分（16kHz * 16bit * 1ch * 0.04s = 1280 字节/帧）
-                frame_size = 1280
-                frames = [
-                    audio_bytes[i:i + frame_size]
-                    for i in range(0, len(audio_bytes), frame_size)
-                ]
+                    frame_size = 1280
+                    frames = [
+                        audio_bytes[i:i + frame_size]
+                        for i in range(0, len(audio_bytes), frame_size)
+                    ]
 
-                # 第一步：语音识别（STT）
-                text = await recognize(frames)
-                if not text.strip():
-                    await websocket.send_text(json.dumps(
-                        {"type": "status", "msg": "没听清，请再说一次"}
-                    ))
-                    continue
+                    text = await recognize(frames)
+                    if not text.strip():
+                        await send_json_to_esp32(client_id, {
+                            "type": "status",
+                            "msg": "没听清，请再说一次"
+                        })
+                        continue
 
-                print(f"[STT] {text}")
-                # 把识别结果先发回去，让 ESP32 屏幕可以显示
-                await websocket.send_text(json.dumps(
-                    {"type": "stt_result", "text": text}
-                ))
+                    print(f"[STT] {text}")
+                    await send_json_to_esp32(client_id, {
+                        "type": "stt_result",
+                        "text": text
+                    })
 
-                # 第二步：送 LLM 对话
-                result = await chat(text)
-                reply = result.get("reply", "")
-                pc_command = result.get("pc_command")
-                print(f"[LLM] reply={reply}, pc_cmd={pc_command}")
+                    result = await chat(text, history)
+                    reply = result.get("reply", "")
+                    pc_command = result.get("pc_command")
+                    print(f"[LLM] reply={reply}, pc_cmd={pc_command}")
 
-                # 如果有电脑控制命令，转发给 PC Agent
-                if pc_command and pc_agents:
-                    agent_ws = next(iter(pc_agents.values()))
-                    await agent_ws.send_text(json.dumps({
-                        "type": "pc_command",
-                        "command": pc_command
-                    }))
-                    print(f"[PC Agent] 已发送命令: {pc_command}")
+                    if pc_command:
+                        sent = await send_pc_command(pc_command, client_id)
+                        if sent:
+                            print(f"[PC Agent] 已发送命令: {pc_command}")
+                        else:
+                            await send_json_to_esp32(client_id, {
+                                "type": "status",
+                                "msg": "没有在线 PC Agent，无法执行电脑控制命令"
+                            })
 
-                # 第三步：回复文字转语音（TTS），发回 ESP32 播放
-                if reply:
-                    audio_data = await synthesize(reply)
-                    audio_b64_out = base64.b64encode(audio_data).decode()
-                    await websocket.send_text(json.dumps({
-                        "type": "tts_audio",
-                        "format": "mp3",
-                        "audio": audio_b64_out,
-                        "text": reply
-                    }))
+                    if reply:
+                        await send_tts_stream_to_esp32(client_id, reply)
 
-            # ========== 心跳 ==========
-            elif data.get("type") == "ping":
-                await websocket.send_text(json.dumps({"type": "pong"}))
+                # ========== 心跳 ==========
+                elif data.get("type") == "ping":
+                    await send_json_to_esp32(client_id, {"type": "pong"})
+
+            except Exception as e:
+                print(f"[ERROR] 处理消息出错: {e}")
+                import traceback
+                traceback.print_exc()
+                try:
+                    await send_json_to_esp32(client_id, {
+                        "type": "status",
+                        "msg": f"处理出错: {str(e)[:100]}"
+                    })
+                except Exception:
+                    pass
 
     except WebSocketDisconnect:
-        print("[ESP32] 已断开")
+        print(f"[ESP32] 已断开 ({client_id})")
+    finally:
+        esp32_clients.pop(client_id, None)
+        esp32_send_locks.pop(client_id, None)
+        if last_active_esp32_id == client_id:
+            last_active_esp32_id = pick_esp32_client()
 
 
 @app.websocket("/ws/pc_agent")
@@ -180,11 +272,19 @@ async def pc_agent_endpoint(websocket: WebSocket):
 
             # PC Agent 执行完命令后返回结果
             if data.get("type") == "result":
-                print(f"[PC Agent] 执行结果: {data.get('result')}")
-                # TODO: 把结果通过 TTS 合成语音，发给 ESP32 播报
+                result_text = data.get("result", "")
+                print(f"[PC Agent] 执行结果: {result_text}")
+
+                target_id = pick_esp32_client(data.get("client_id"))
+                if target_id and result_text:
+                    sent = await send_tts_stream_to_esp32(target_id, result_text)
+                    if sent:
+                        print(f"[ESP32] 已播报 PC Agent 结果 -> {target_id}")
+                elif not target_id:
+                    print("[ESP32] 没有在线客户端，无法播报 PC Agent 结果")
 
             elif data.get("type") == "ping":
-                await websocket.send_text(json.dumps({"type": "pong"}))
+                await websocket.send_text(json.dumps({"type": "pong"}, ensure_ascii=False))
 
     except WebSocketDisconnect:
         pc_agents.pop(agent_id, None)
@@ -196,7 +296,8 @@ async def health():
     """健康检查接口，用于确认服务是否在线"""
     return {
         "status": "ok",
-        "esp32_connected": False,
+        "esp32_connected": bool(esp32_clients),
+        "esp32_clients": len(esp32_clients),
         "pc_agents": len(pc_agents)
     }
 
@@ -204,4 +305,10 @@ async def health():
 if __name__ == "__main__":
     import uvicorn
     # 启动 WebSocket 服务，默认监听 0.0.0.0:8000
-    uvicorn.run(app, host=SERVER_HOST, port=int(SERVER_PORT))
+    uvicorn.run(
+        app,
+        host=SERVER_HOST,
+        port=int(SERVER_PORT),
+        ws_ping_interval=30,
+        ws_ping_timeout=120
+    )

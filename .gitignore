@@ -1,0 +1,18 @@
+# Local secrets
+.env
+.env.local
+server/.env
+
+# Local tool state
+.claude/settings.local.json
+
+# Python cache and environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Generated runtime files
+server/last_response.json
+server/reply.mp3
