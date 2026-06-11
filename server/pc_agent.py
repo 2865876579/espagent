@@ -136,6 +136,8 @@ async def run():
                     if data.get("type") == "pc_command":
                         command = data.get("command", {})
                         client_id = data.get("client_id")
+                        turn_id = data.get("turn_id")
+                        command_id = data.get("command_id")
                         print(f"[收到命令] {command}")
 
                         # 执行命令
@@ -146,6 +148,8 @@ async def run():
                         await ws.send(json.dumps({
                             "type": "result",
                             "client_id": client_id,
+                            "turn_id": turn_id,
+                            "command_id": command_id,
                             "result": result
                         }, ensure_ascii=False))
 

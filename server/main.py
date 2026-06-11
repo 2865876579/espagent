@@ -18,6 +18,8 @@ WebSocket 端点：
 import json
 import asyncio
 import base64
+import re
+import time
 import urllib.parse
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from config import SERVER_HOST, SERVER_PORT
@@ -27,7 +29,7 @@ from tts_edge import synthesize
 from web_search import direct_answer_from_results, format_search_results, search_web
 
 app = FastAPI(title="Smart Pillow Cloud Server")
-APP_VERSION = "web_search_no_browser_v2"
+APP_VERSION = "search_intent_interrupt_v4"
 
 # 存储已连接的 PC Agent，key 是连接 id，value 是 WebSocket 对象
 # 当 LLM 返回电脑控制命令时，会从这里取一个 Agent 转发命令
@@ -36,11 +38,18 @@ pc_agents: dict[str, WebSocket] = {}
 # 存储已连接的 ESP32 客户端，PC Agent 回传结果时用于播报到设备。
 esp32_clients: dict[str, WebSocket] = {}
 esp32_send_locks: dict[str, asyncio.Lock] = {}
+esp32_sessions: dict[str, dict] = {}
+pc_command_contexts: dict[str, dict] = {}
 last_active_esp32_id: str | None = None
 
 REALTIME_KEYWORDS = (
-    "天气", "气温", "金价", "黄金", "新闻", "股票", "股价", "汇率", "油价",
-    "价格", "行情", "比分", "赛程", "热搜", "今天", "现在", "最新"
+    "天气", "气温", "金价", "黄金", "新闻", "大事", "时事", "热点", "热搜",
+    "股票", "股价", "汇率", "油价", "行情", "比分", "赛程"
+)
+REALTIME_TIME_WORDS = ("今天", "今日", "现在", "最新", "最近")
+REALTIME_SUBJECT_WORDS = (
+    "新闻", "大事", "发生", "事件", "热点", "热搜", "金价", "黄金", "天气", "气温",
+    "股票", "股价", "汇率", "油价", "价格", "行情", "比分", "赛程", "政策", "航班"
 )
 
 
@@ -56,7 +65,13 @@ async def send_json_to_esp32(client_id: str, payload: dict) -> bool:
     return True
 
 
-async def send_tts_stream_to_esp32(client_id: str, text: str) -> bool:
+async def send_tts_stream_to_esp32(
+    client_id: str,
+    text: str,
+    *,
+    source: str = "assistant",
+    turn_id: int | None = None,
+) -> bool:
     """
     把 TTS 音频流式发送到指定 ESP32。
 
@@ -69,16 +84,34 @@ async def send_tts_stream_to_esp32(client_id: str, text: str) -> bool:
     lock = esp32_send_locks.get(client_id)
     if websocket is None or lock is None:
         return False
+    if source == "assistant" and not is_current_turn(client_id, turn_id):
+        return False
 
     async with lock:
+        if source == "assistant" and not is_current_turn(client_id, turn_id):
+            return False
+
         await websocket.send_text(json.dumps({
             "type": "tts_audio_start",
             "format": "mp3",
-            "text": text
+            "text": text,
+            "source": source,
+            "turn_id": turn_id
         }, ensure_ascii=False))
 
         chunks = 0
         async for audio_chunk in synthesize(text):
+            if source == "assistant" and not is_current_turn(client_id, turn_id):
+                await websocket.send_text(json.dumps({
+                    "type": "tts_audio_end",
+                    "format": "mp3",
+                    "text": text,
+                    "chunks": chunks,
+                    "source": source,
+                    "turn_id": turn_id,
+                    "interrupted": True
+                }, ensure_ascii=False))
+                return False
             if not audio_chunk:
                 continue
             chunks += 1
@@ -86,6 +119,8 @@ async def send_tts_stream_to_esp32(client_id: str, text: str) -> bool:
                 "type": "tts_audio_chunk",
                 "format": "mp3",
                 "seq": chunks,
+                "source": source,
+                "turn_id": turn_id,
                 "audio": base64.b64encode(audio_chunk).decode()
             }, ensure_ascii=False))
 
@@ -93,24 +128,49 @@ async def send_tts_stream_to_esp32(client_id: str, text: str) -> bool:
             "type": "tts_audio_end",
             "format": "mp3",
             "text": text,
-            "chunks": chunks
+            "chunks": chunks,
+            "source": source,
+            "turn_id": turn_id
         }, ensure_ascii=False))
 
     return True
 
 
-async def send_pc_command(pc_command: dict, client_id: str) -> bool:
+async def send_pc_command(pc_command: dict, client_id: str, turn_id: int) -> bool:
     """把 LLM 产生的电脑控制命令转发给任意一个已连接的 PC Agent。"""
     if not pc_agents:
         return False
+
+    command_id = f"{client_id}:{turn_id}:{int(time.time() * 1000)}"
+    pc_command_contexts[command_id] = {
+        "client_id": client_id,
+        "turn_id": turn_id,
+        "action": pc_command.get("action"),
+        "created_at": time.monotonic(),
+    }
 
     agent_ws = next(iter(pc_agents.values()))
     await agent_ws.send_text(json.dumps({
         "type": "pc_command",
         "client_id": client_id,
+        "turn_id": turn_id,
+        "command_id": command_id,
         "command": pc_command
     }, ensure_ascii=False))
     return True
+
+
+def next_turn_id(client_id: str) -> int:
+    session = esp32_sessions.setdefault(client_id, {"turn_id": 0})
+    session["turn_id"] = int(session.get("turn_id", 0)) + 1
+    return session["turn_id"]
+
+
+def is_current_turn(client_id: str, turn_id: int | None) -> bool:
+    if turn_id is None:
+        return True
+    session = esp32_sessions.get(client_id) or {}
+    return int(session.get("turn_id", -1)) == int(turn_id)
 
 
 def pick_esp32_client(client_id: str | None = None) -> str | None:
@@ -156,6 +216,13 @@ def should_force_web_search(user_text: str, result: dict) -> bool:
     """Fallback for realtime/search questions when the model does not emit web_search."""
     if any(keyword in user_text for keyword in REALTIME_KEYWORDS):
         return True
+    if (
+        any(word in user_text for word in REALTIME_TIME_WORDS)
+        and any(word in user_text for word in REALTIME_SUBJECT_WORDS)
+    ):
+        return True
+    if re.search(r"(有什么|发生了什么).*(新闻|大事|热点|热搜|事件)", user_text):
+        return True
 
     reply = str(result.get("reply", ""))
     if any(word in reply for word in ("正在帮你搜索", "帮你搜索", "帮你查", "查一下")):
@@ -199,8 +266,11 @@ def get_web_search_query(result: dict, user_text: str) -> str | None:
     return None
 
 
-async def handle_ai_result(client_id: str, user_text: str, result: dict, history: list[dict]) -> None:
+async def handle_ai_result(client_id: str, user_text: str, result: dict, history: list[dict], turn_id: int) -> None:
     """Handle LLM output: background web search, PC command, and spoken reply."""
+    if not is_current_turn(client_id, turn_id):
+        return
+
     query = get_web_search_query(result, user_text)
     if query:
         print(f"[WebSearch] query={query}")
@@ -209,6 +279,8 @@ async def handle_ai_result(client_id: str, user_text: str, result: dict, history
             "msg": f"正在联网查询：{query}"
         })
         results = await search_web(query)
+        if not is_current_turn(client_id, turn_id):
+            return
         if not results:
             reply = "我刚才没查到可靠结果，可以换个关键词再问我一次。"
         else:
@@ -216,10 +288,15 @@ async def handle_ai_result(client_id: str, user_text: str, result: dict, history
             if not reply:
                 search_context = format_search_results(query, results)
                 reply = await answer_with_search_results(user_text, query, search_context, history)
+                if not is_current_turn(client_id, turn_id):
+                    return
                 if not reply:
                     reply = "我查到了结果，但暂时没能整理成回答。"
 
-        await send_tts_stream_to_esp32(client_id, reply)
+        await send_tts_stream_to_esp32(client_id, reply, turn_id=turn_id)
+        return
+
+    if not is_current_turn(client_id, turn_id):
         return
 
     reply = result.get("reply", "")
@@ -227,7 +304,7 @@ async def handle_ai_result(client_id: str, user_text: str, result: dict, history
     print(f"[LLM] reply={reply}, pc_cmd={pc_command}")
 
     if pc_command:
-        sent = await send_pc_command(pc_command, client_id)
+        sent = await send_pc_command(pc_command, client_id, turn_id)
         if not sent:
             await send_json_to_esp32(client_id, {
                 "type": "status",
@@ -235,7 +312,95 @@ async def handle_ai_result(client_id: str, user_text: str, result: dict, history
             })
 
     if reply:
-        await send_tts_stream_to_esp32(client_id, reply)
+        await send_tts_stream_to_esp32(client_id, reply, turn_id=turn_id)
+
+
+async def cancel_active_task(client_id: str) -> None:
+    session = esp32_sessions.get(client_id) or {}
+    task = session.get("active_task")
+    if not task or task.done():
+        return
+
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    except Exception as exc:
+        print(f"[Task] 取消旧任务时发现异常: {exc}")
+
+
+async def process_text_turn(client_id: str, text: str, history: list[dict], turn_id: int) -> None:
+    try:
+        result = await chat(text, history)
+        if not is_current_turn(client_id, turn_id):
+            return
+        await handle_ai_result(client_id, text, result, history, turn_id)
+    except asyncio.CancelledError:
+        print(f"[Task] 旧文本任务已取消: turn_id={turn_id}")
+        raise
+    except Exception as e:
+        print(f"[ERROR] 处理文本消息出错: {e}")
+        import traceback
+        traceback.print_exc()
+        if is_current_turn(client_id, turn_id):
+            try:
+                await send_json_to_esp32(client_id, {
+                    "type": "status",
+                    "msg": f"处理出错: {str(e)[:100]}",
+                    "turn_id": turn_id
+                })
+            except Exception:
+                pass
+
+
+async def process_audio_turn(client_id: str, audio_b64: str, history: list[dict], turn_id: int) -> None:
+    try:
+        audio_bytes = base64.b64decode(audio_b64)
+        frame_size = 1280
+        frames = [
+            audio_bytes[i:i + frame_size]
+            for i in range(0, len(audio_bytes), frame_size)
+        ]
+
+        text = await recognize(frames)
+        if not is_current_turn(client_id, turn_id):
+            return
+        if not text.strip():
+            await send_json_to_esp32(client_id, {
+                "type": "status",
+                "msg": "没听清，请再说一次",
+                "turn_id": turn_id
+            })
+            return
+
+        print(f"[STT] {text}")
+        await send_json_to_esp32(client_id, {
+            "type": "stt_result",
+            "text": text,
+            "turn_id": turn_id
+        })
+
+        result = await chat(text, history)
+        if not is_current_turn(client_id, turn_id):
+            return
+        await handle_ai_result(client_id, text, result, history, turn_id)
+    except asyncio.CancelledError:
+        print(f"[Task] 旧语音任务已取消: turn_id={turn_id}")
+        raise
+    except Exception as e:
+        print(f"[ERROR] 处理语音消息出错: {e}")
+        import traceback
+        traceback.print_exc()
+        if is_current_turn(client_id, turn_id):
+            try:
+                await send_json_to_esp32(client_id, {
+                    "type": "status",
+                    "msg": f"处理出错: {str(e)[:100]}",
+                    "turn_id": turn_id
+                })
+            except Exception:
+                pass
 
 
 @app.websocket("/ws/esp32")
@@ -267,6 +432,7 @@ async def esp32_endpoint(websocket: WebSocket):
     client_id = str(id(websocket))
     esp32_clients[client_id] = websocket
     esp32_send_locks[client_id] = asyncio.Lock()
+    esp32_sessions[client_id] = {"turn_id": 0}
     last_active_esp32_id = client_id
     history: list[dict] = []
     print(f"[ESP32] 已连接 ({client_id})")
@@ -281,39 +447,24 @@ async def esp32_endpoint(websocket: WebSocket):
             try:
                 # ========== 文字模式（调试用，跳过 STT）==========
                 if data.get("type") == "text":
-                    text = data["text"]
+                    text = str(data["text"]).strip()
+                    if not text:
+                        continue
+                    turn_id = next_turn_id(client_id)
+                    await cancel_active_task(client_id)
                     print(f"[Text] {text}")
 
-                    result = await chat(text, history)
-                    await handle_ai_result(client_id, text, result, history)
+                    task = asyncio.create_task(process_text_turn(client_id, text, history, turn_id))
+                    esp32_sessions[client_id]["active_task"] = task
 
                 # ========== 语音模式（正式流程：STT -> LLM -> TTS）==========
                 elif data.get("type") == "audio":
                     audio_b64 = data["audio"]
-                    audio_bytes = base64.b64decode(audio_b64)
+                    turn_id = next_turn_id(client_id)
+                    await cancel_active_task(client_id)
 
-                    frame_size = 1280
-                    frames = [
-                        audio_bytes[i:i + frame_size]
-                        for i in range(0, len(audio_bytes), frame_size)
-                    ]
-
-                    text = await recognize(frames)
-                    if not text.strip():
-                        await send_json_to_esp32(client_id, {
-                            "type": "status",
-                            "msg": "没听清，请再说一次"
-                        })
-                        continue
-
-                    print(f"[STT] {text}")
-                    await send_json_to_esp32(client_id, {
-                        "type": "stt_result",
-                        "text": text
-                    })
-
-                    result = await chat(text, history)
-                    await handle_ai_result(client_id, text, result, history)
+                    task = asyncio.create_task(process_audio_turn(client_id, audio_b64, history, turn_id))
+                    esp32_sessions[client_id]["active_task"] = task
 
                 # ========== 心跳 ==========
                 elif data.get("type") == "ping":
@@ -334,8 +485,16 @@ async def esp32_endpoint(websocket: WebSocket):
     except WebSocketDisconnect:
         print(f"[ESP32] 已断开 ({client_id})")
     finally:
+        try:
+            await cancel_active_task(client_id)
+        except Exception:
+            pass
         esp32_clients.pop(client_id, None)
         esp32_send_locks.pop(client_id, None)
+        esp32_sessions.pop(client_id, None)
+        for command_id, context in list(pc_command_contexts.items()):
+            if context.get("client_id") == client_id:
+                pc_command_contexts.pop(command_id, None)
         if last_active_esp32_id == client_id:
             last_active_esp32_id = pick_esp32_client()
 
@@ -369,13 +528,43 @@ async def pc_agent_endpoint(websocket: WebSocket):
             # PC Agent 执行完命令后返回结果
             if data.get("type") == "result":
                 result_text = data.get("result", "")
+                command_id = data.get("command_id")
+                result_turn_id = data.get("turn_id")
                 print(f"[PC Agent] 执行结果: {result_text}")
 
-                target_id = pick_esp32_client(data.get("client_id"))
+                context = pc_command_contexts.pop(command_id, None) if command_id else None
+                target_id = pick_esp32_client(data.get("client_id") or (context or {}).get("client_id"))
+                action = (context or {}).get("action")
+                current_turn_id = (esp32_sessions.get(target_id or "", {}) or {}).get("turn_id")
+                age = time.monotonic() - float((context or {}).get("created_at", time.monotonic()))
+                is_current = (
+                    target_id
+                    and result_turn_id is not None
+                    and current_turn_id is not None
+                    and int(result_turn_id) == int(current_turn_id)
+                    and age <= 8
+                )
+
                 if target_id and result_text:
-                    sent = await send_tts_stream_to_esp32(target_id, result_text)
-                    if sent:
-                        print(f"[ESP32] 已播报 PC Agent 结果 -> {target_id}")
+                    if action in ("open_url", "open_file"):
+                        print(f"[ESP32] PC Agent {action} 结果静音，不打断对话 -> {target_id}")
+                    elif action == "summarize_file" and is_current:
+                        sent = await send_tts_stream_to_esp32(
+                            target_id,
+                            result_text,
+                            source="pc_result",
+                            turn_id=int(result_turn_id)
+                        )
+                        if sent:
+                            print(f"[ESP32] 已播报 PC Agent 结果 -> {target_id}")
+                    else:
+                        await send_json_to_esp32(target_id, {
+                            "type": "status",
+                            "msg": result_text,
+                            "source": "pc_result",
+                            "turn_id": result_turn_id
+                        })
+                        print(f"[ESP32] PC Agent 结果仅状态提示，不语音插队 -> {target_id}")
                 elif not target_id:
                     print("[ESP32] 没有在线客户端，无法播报 PC Agent 结果")
 

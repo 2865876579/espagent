@@ -22,10 +22,12 @@ import websockets
 import os
 
 
-async def recv_tts_stream(ws) -> None:
+async def recv_tts_stream(ws, expected_turn_id: int) -> None:
     """接收服务端的流式 TTS 消息，直到 tts_audio_end。"""
     audio_parts: list[bytes] = []
     reply_text = ""
+    stream_source = "assistant"
+    stream_turn_id: int | None = None
 
     while True:
         response = await asyncio.wait_for(ws.recv(), timeout=180)
@@ -34,7 +36,14 @@ async def recv_tts_stream(ws) -> None:
 
         if msg_type == "tts_audio_start":
             reply_text = data.get("text", "")
-            print(f"AI: {reply_text}")
+            stream_source = data.get("source", "assistant")
+            stream_turn_id = data.get("turn_id")
+            if stream_turn_id is not None:
+                stream_turn_id = int(stream_turn_id)
+            if stream_source == "assistant" and stream_turn_id == expected_turn_id:
+                print(f"AI: {reply_text}")
+            else:
+                print(f"[异步] {reply_text}")
 
         elif msg_type == "tts_audio_chunk":
             audio_b64 = data.get("audio", "")
@@ -42,7 +51,8 @@ async def recv_tts_stream(ws) -> None:
                 audio_parts.append(base64.b64decode(audio_b64))
 
         elif msg_type == "tts_audio_end":
-            if not reply_text:
+            is_current_answer = stream_source == "assistant" and stream_turn_id == expected_turn_id
+            if not reply_text and is_current_answer:
                 reply_text = data.get("text", "")
                 print(f"AI: {reply_text}")
             if audio_parts:
@@ -50,10 +60,15 @@ async def recv_tts_stream(ws) -> None:
                 filename = "reply.mp3"
                 with open(filename, "wb") as f:
                     f.write(audio_bytes)
-                print(f"[音频已保存到 {filename}，{len(audio_bytes)} bytes]\n")
+                if is_current_answer:
+                    print(f"[音频已保存到 {filename}，{len(audio_bytes)} bytes]\n")
             else:
-                print("[TTS 未生成音频，但文字回复正常]\n")
-            return
+                if is_current_answer:
+                    print("[TTS 未生成音频，但文字回复正常]\n")
+            audio_parts = []
+            reply_text = ""
+            if is_current_answer:
+                return
 
         # 兼容旧协议，方便回归测试。
         elif msg_type == "tts_audio":
@@ -73,7 +88,9 @@ async def recv_tts_stream(ws) -> None:
             print(f"[识别] {data.get('text')}")
 
         elif msg_type == "status":
-            print(f"[状态] {data.get('msg')}\n")
+            source = data.get("source", "")
+            prefix = "[异步状态]" if source == "pc_result" else "[状态]"
+            print(f"{prefix} {data.get('msg')}\n")
 
 
 async def test_text_mode():
@@ -91,6 +108,7 @@ async def test_text_mode():
                 ping_timeout=120
             ) as ws:
                 print("已连接！输入文字测试对话，输入 quit 退出\n")
+                turn_id = 0
 
                 while True:
                     # input() 会阻塞事件循环，导致 WebSocket 不能及时响应 ping。
@@ -101,6 +119,7 @@ async def test_text_mode():
                         return
                     if not text:
                         continue
+                    turn_id += 1
 
                     # 发送文字消息给服务端（type=text 会跳过 STT，直接送 LLM）
                     await ws.send(json.dumps({
@@ -109,7 +128,7 @@ async def test_text_mode():
                     }, ensure_ascii=False))
 
                     try:
-                        await recv_tts_stream(ws)
+                        await recv_tts_stream(ws, turn_id)
                     except asyncio.TimeoutError:
                         print("[超时] 服务端 180 秒没完成 TTS 回复\n")
 
