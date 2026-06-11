@@ -1,4 +1,22 @@
-"""讯飞流式语音识别"""
+"""
+讯飞流式语音识别模块
+
+功能：接收 PCM 音频帧，通过讯飞 WebSocket API 实时转成文字。
+
+讯飞 API 文档：https://www.xfyun.cn/doc/asr/voicedictation/API.html
+
+音频要求：
+  - 格式：PCM 原始数据（不是 WAV，不带文件头）
+  - 采样率：16kHz
+  - 位深：16bit
+  - 声道：单声道
+
+调用流程：
+  1. 用 APP_ID + API_KEY + API_SECRET 生成鉴权 URL
+  2. 建立 WebSocket 连接到讯飞服务器
+  3. 分帧发送音频数据（每帧约 40ms）
+  4. 实时接收识别结果，最终拼接成完整文字
+"""
 import websocket
 import hashlib
 import hmac
@@ -11,22 +29,31 @@ from config import XF_APP_ID, XF_API_KEY, XF_API_SECRET
 
 
 def _create_url():
+    """
+    生成讯飞 WebSocket 鉴权 URL
+
+    讯飞用 HMAC-SHA256 签名做鉴权，把签名信息编码在 URL query 参数里。
+    签名内容包括：host、date、请求行，用 API_SECRET 做 HMAC 密钥。
+    """
     url = "wss://iat-api.xfyun.cn/v2/iat"
     now = datetime.utcnow()
     date = now.strftime("%a, %d %b %Y %H:%M:%S GMT")
 
     parsed = urlparse(url)
+    # 按讯飞要求拼接签名原文
     signature_origin = (
         f"host: {parsed.netloc}\n"
         f"date: {date}\n"
         f"GET {parsed.path} HTTP/1.1"
     )
 
+    # HMAC-SHA256 签名
     signature_sha = hmac.new(
         XF_API_SECRET.encode(), signature_origin.encode(), digestmod=hashlib.sha256
     ).digest()
     signature = base64.b64encode(signature_sha).decode()
 
+    # 拼接 authorization 字符串
     authorization_origin = (
         f'api_key="{XF_API_KEY}", '
         f'algorithm="hmac-sha256", '
@@ -35,43 +62,59 @@ def _create_url():
     )
     authorization = base64.b64encode(authorization_origin.encode()).decode()
 
+    # 最终鉴权参数放在 URL query 里
     params = {"authorization": authorization, "date": date, "host": parsed.netloc}
     return url + "?" + urlencode(params)
 
 
 async def recognize(audio_frames: list[bytes]) -> str:
     """
-    接收 PCM 音频帧列表，返回识别文本。
-    audio_frames: 16kHz 16bit 单声道 PCM 数据块列表
+    语音识别主函数
+
+    参数：
+      audio_frames: PCM 音频帧列表，每帧 1280 字节（40ms，16kHz/16bit/mono）
+
+    返回：
+      识别出的文字字符串，识别失败返回空字符串
+
+    实现方式：
+      因为讯飞 SDK 用的是同步 websocket-client 库，
+      这里在子线程里跑 WebSocket，主协程等待识别完成事件。
     """
     import asyncio
 
-    result_text = []
-    done_event = asyncio.Event()
+    result_text = []  # 收集识别结果片段
+    done_event = asyncio.Event()  # 标记识别结束
 
     def on_message(ws, message):
+        """收到讯飞返回的识别结果"""
         data = json.loads(message)
         if data.get("code") != 0:
+            # 识别出错，结束
             done_event.set()
             return
+        # 解析识别结果：data.result.ws[].cw[].w 是文字片段
         results = data.get("data", {}).get("result", {}).get("ws", [])
         for w in results:
             for cw in w.get("cw", []):
                 result_text.append(cw.get("w", ""))
+        # status == 2 表示识别结束
         if data.get("data", {}).get("status") == 2:
             done_event.set()
 
     def on_open(ws):
+        """连接建立后，开始逐帧发送音频"""
+        # 讯飞协议：第一帧带 common+business，中间帧只带 data，最后一帧标记结束
         STATUS_FIRST = 0
         STATUS_CONTINUE = 1
         STATUS_LAST = 2
 
         common = {"app_id": XF_APP_ID}
         business = {
-            "language": "zh_cn",
-            "domain": "iat",
-            "accent": "mandarin",
-            "vad_eos": 3000,
+            "language": "zh_cn",      # 中文
+            "domain": "iat",          # 日常用语
+            "accent": "mandarin",     # 普通话
+            "vad_eos": 3000,          # 静音检测：3秒无声自动断句
         }
 
         for i, frame in enumerate(audio_frames):
@@ -84,32 +127,37 @@ async def recognize(audio_frames: list[bytes]) -> str:
 
             data = {
                 "status": status,
-                "format": "audio/L16;rate=16000",
+                "format": "audio/L16;rate=16000",  # PCM 16kHz
                 "encoding": "raw",
                 "audio": base64.b64encode(frame).decode(),
             }
 
             payload = {"data": data}
             if status == STATUS_FIRST:
+                # 第一帧要带上应用信息和业务参数
                 payload["common"] = common
                 payload["business"] = business
 
             ws.send(json.dumps(payload))
+            # 每帧间隔 40ms，模拟实时音频流速率
             time.sleep(0.04)
 
     def on_error(ws, error):
+        """连接出错时结束等待"""
         done_event.set()
 
+    # 建立到讯飞的 WebSocket 连接
     url = _create_url()
     ws = websocket.WebSocketApp(
         url, on_message=on_message, on_open=on_open, on_error=on_error
     )
 
+    # 在子线程运行同步 WebSocket（避免阻塞 asyncio 事件循环）
     import threading
     t = threading.Thread(target=ws.run_forever)
     t.start()
 
-    loop = asyncio.get_event_loop()
+    # 等待识别完成，最多等 15 秒
     await asyncio.wait_for(done_event.wait(), timeout=15)
     ws.close()
     t.join(timeout=2)
