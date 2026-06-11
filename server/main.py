@@ -24,7 +24,7 @@ from config import SERVER_HOST, SERVER_PORT
 from stt_xunfei import recognize
 from llm_deepseek import answer_with_search_results, chat
 from tts_edge import synthesize
-from web_search import format_search_results, search_web
+from web_search import direct_answer_from_results, format_search_results, search_web
 
 app = FastAPI(title="Smart Pillow Cloud Server")
 APP_VERSION = "web_search_no_browser_v2"
@@ -212,10 +212,12 @@ async def handle_ai_result(client_id: str, user_text: str, result: dict, history
         if not results:
             reply = "我刚才没查到可靠结果，可以换个关键词再问我一次。"
         else:
-            search_context = format_search_results(query, results)
-            reply = await answer_with_search_results(user_text, query, search_context, history)
+            reply = direct_answer_from_results(query, results)
             if not reply:
-                reply = "我查到了结果，但暂时没能整理成回答。"
+                search_context = format_search_results(query, results)
+                reply = await answer_with_search_results(user_text, query, search_context, history)
+                if not reply:
+                    reply = "我查到了结果，但暂时没能整理成回答。"
 
         await send_tts_stream_to_esp32(client_id, reply)
         return

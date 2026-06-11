@@ -38,6 +38,8 @@ WEATHER_TRANSLATIONS = {
     "Thundery outbreaks in nearby": "附近有雷雨",
 }
 
+GOLD_KEYWORDS = ("金价", "黄金", "金店", "足金", "支付宝金", "积存金", "现货金", "Au99")
+
 
 @dataclass
 class SearchResult:
@@ -58,6 +60,95 @@ def _read_url(url: str, timeout: int = 12) -> str:
     with urllib.request.urlopen(request, timeout=timeout) as response:
         charset = response.headers.get_content_charset() or "utf-8"
         return response.read().decode(charset, errors="replace")
+
+
+def _read_sina_quote(symbol: str) -> str:
+    url = f"https://hq.sinajs.cn/list={symbol}"
+    request = urllib.request.Request(url, headers={
+        "User-Agent": USER_AGENT,
+        "Referer": "https://finance.sina.com.cn/",
+    })
+    with urllib.request.urlopen(request, timeout=10) as response:
+        return response.read().decode("gbk", errors="replace")
+
+
+def _parse_sina_assignment(text: str) -> list[str]:
+    match = re.search(r'="(.*)";', text)
+    if not match:
+        return []
+    value = match.group(1).strip()
+    if not value:
+        return []
+    return [part.strip() for part in value.split(",")]
+
+
+def _fmt_number(value: str, suffix: str = "") -> str:
+    try:
+        return f"{float(value):.2f}{suffix}"
+    except Exception:
+        return value + suffix if value else "未知"
+
+
+def _gold_search(query: str) -> list[SearchResult]:
+    if not any(keyword.lower() in query.lower() for keyword in GOLD_KEYWORDS):
+        return []
+
+    results: list[SearchResult] = []
+
+    try:
+        parts = _parse_sina_assignment(_read_sina_quote("SGE_AU9999"))
+        if len(parts) >= 18:
+            results.append(SearchResult(
+                title="上海黄金交易所 Au99.99",
+                url="https://finance.sina.com.cn/futures/quotes/SGE_AU9999.shtml",
+                snippet=(
+                    f"最新{_fmt_number(parts[3], '元/克')}，"
+                    f"涨跌幅{parts[17]}，时间{parts[16]}。"
+                ),
+            ))
+    except Exception as exc:
+        print(f"[GoldSearch] SGE_AU9999 failed: {exc}")
+
+    try:
+        parts = _parse_sina_assignment(_read_sina_quote("SGE_AUTD"))
+        if len(parts) >= 18:
+            results.append(SearchResult(
+                title="上海黄金交易所 Au(T+D)",
+                url="https://finance.sina.com.cn/futures/quotes/SGE_AUTD.shtml",
+                snippet=(
+                    f"最新{_fmt_number(parts[3], '元/克')}，"
+                    f"涨跌幅{parts[17]}，时间{parts[16]}。"
+                ),
+            ))
+    except Exception as exc:
+        print(f"[GoldSearch] SGE_AUTD failed: {exc}")
+
+    try:
+        parts = _parse_sina_assignment(_read_sina_quote("hf_XAU"))
+        if len(parts) >= 15:
+            results.append(SearchResult(
+                title=parts[14] or "伦敦金（现货黄金）",
+                url="https://finance.sina.com.cn/futures/quotes/hf_XAU.shtml",
+                snippet=(
+                    f"最新{_fmt_number(parts[0], '美元/盎司')}，"
+                    f"日内高点{_fmt_number(parts[4])}，低点{_fmt_number(parts[5])}，"
+                    f"时间{parts[13]} {parts[6]}。"
+                ),
+            ))
+    except Exception as exc:
+        print(f"[GoldSearch] hf_XAU failed: {exc}")
+
+    if "支付宝" in query and results:
+        results.insert(0, SearchResult(
+            title="支付宝金价说明",
+            url="https://www.alipay.com/",
+            snippet=(
+                "支付宝内的黄金价格通常和具体黄金基金、积存金产品、买卖差价或服务费有关，"
+                "未必等同于上海金实时盘面价。下面行情可作为基准参考，最终以支付宝 App 内页面为准。"
+            ),
+        ))
+
+    return results
 
 
 def _extract_weather_location(query: str) -> str | None:
@@ -166,9 +257,14 @@ def _search_duckduckgo_lite(query: str, max_results: int) -> list[SearchResult]:
 def _search_sync(query: str, max_results: int) -> list[SearchResult]:
     errors: list[str] = []
     try:
-        priority_results = _weather_search(query)
+        priority_results = _gold_search(query)
     except Exception as exc:
         priority_results = []
+        errors.append(f"_gold_search: {exc}")
+
+    try:
+        priority_results += _weather_search(query)
+    except Exception as exc:
         errors.append(f"_weather_search: {exc}")
 
     for searcher in (_search_bing_rss, _search_duckduckgo_lite):
@@ -198,3 +294,36 @@ def format_search_results(query: str, results: list[SearchResult]) -> str:
             lines.append(f"摘要：{item.snippet}")
         lines.append(f"链接：{item.url}")
     return "\n".join(lines)
+
+
+def direct_answer_from_results(query: str, results: list[SearchResult]) -> str | None:
+    """Return a deterministic spoken answer for structured data sources."""
+    if not results:
+        return None
+
+    if any(keyword.lower() in query.lower() for keyword in GOLD_KEYWORDS):
+        au9999 = next((item for item in results if "Au99.99" in item.title), None)
+        autd = next((item for item in results if "Au(T+D)" in item.title), None)
+        alipay = "支付宝" in query
+
+        parts: list[str] = []
+        if au9999:
+            parts.append(f"上海金 Au99.99：{au9999.snippet.rstrip('。')}")
+        if autd:
+            parts.append(f"黄金 T+D：{autd.snippet.rstrip('。')}")
+        if not parts:
+            return None
+
+        answer = "；".join(parts)
+        if alipay:
+            answer += "。支付宝里的金价还会受具体产品和买卖差价影响，最终以支付宝 App 页面为准。"
+        else:
+            answer += "。这是交易所行情，不等同于金店零售价。"
+        return answer
+
+    weather = next((item for item in results if item.title.endswith("当前天气")), None)
+    if weather:
+        city = weather.title.removesuffix("当前天气")
+        return f"{city}现在{weather.snippet}。"
+
+    return None
