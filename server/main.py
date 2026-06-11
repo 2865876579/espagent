@@ -18,13 +18,16 @@ WebSocket 端点：
 import json
 import asyncio
 import base64
+import urllib.parse
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from config import SERVER_HOST, SERVER_PORT
 from stt_xunfei import recognize
-from llm_deepseek import chat
+from llm_deepseek import answer_with_search_results, chat
 from tts_edge import synthesize
+from web_search import format_search_results, search_web
 
 app = FastAPI(title="Smart Pillow Cloud Server")
+APP_VERSION = "web_search_no_browser_v2"
 
 # 存储已连接的 PC Agent，key 是连接 id，value 是 WebSocket 对象
 # 当 LLM 返回电脑控制命令时，会从这里取一个 Agent 转发命令
@@ -34,6 +37,11 @@ pc_agents: dict[str, WebSocket] = {}
 esp32_clients: dict[str, WebSocket] = {}
 esp32_send_locks: dict[str, asyncio.Lock] = {}
 last_active_esp32_id: str | None = None
+
+REALTIME_KEYWORDS = (
+    "天气", "气温", "金价", "黄金", "新闻", "股票", "股价", "汇率", "油价",
+    "价格", "行情", "比分", "赛程", "热搜", "今天", "现在", "最新"
+)
 
 
 async def send_json_to_esp32(client_id: str, payload: dict) -> bool:
@@ -114,6 +122,120 @@ def pick_esp32_client(client_id: str | None = None) -> str | None:
     return next(iter(esp32_clients.keys()), None)
 
 
+def extract_search_query_from_url(url: str) -> str | None:
+    """Return query text if URL is a search-engine result page."""
+    parsed = urllib.parse.urlparse(url)
+    host = parsed.netloc.lower()
+    params = urllib.parse.parse_qs(parsed.query)
+
+    search_param_names: tuple[str, ...] | None = None
+    if "baidu.com" in host:
+        search_param_names = ("wd", "word", "q")
+    elif "bing.com" in host:
+        search_param_names = ("q",)
+    elif "google." in host:
+        search_param_names = ("q",)
+    elif "duckduckgo.com" in host:
+        search_param_names = ("q",)
+    elif "sogou.com" in host:
+        search_param_names = ("query", "keyword", "q")
+    elif "so.com" in host or "haosou.com" in host:
+        search_param_names = ("q",)
+
+    if not search_param_names:
+        return None
+
+    for name in search_param_names:
+        values = params.get(name)
+        if values and values[0].strip():
+            return urllib.parse.unquote_plus(values[0]).strip()
+    return None
+
+
+def should_force_web_search(user_text: str, result: dict) -> bool:
+    """Fallback for realtime/search questions when the model does not emit web_search."""
+    if any(keyword in user_text for keyword in REALTIME_KEYWORDS):
+        return True
+
+    reply = str(result.get("reply", ""))
+    if any(word in reply for word in ("正在帮你搜索", "帮你搜索", "帮你查", "查一下")):
+        return True
+
+    return False
+
+
+def get_web_search_query(result: dict, user_text: str) -> str | None:
+    """Extract the background web-search query from new or legacy LLM output."""
+    web_search = result.get("web_search")
+    if isinstance(web_search, dict):
+        query = web_search.get("query")
+        if query:
+            return str(query).strip()
+    elif isinstance(web_search, str) and web_search.strip():
+        return web_search.strip()
+
+    # Backward compatibility: older prompts used pc_command.search.
+    pc_command = result.get("pc_command")
+    if isinstance(pc_command, dict) and pc_command.get("action") == "search":
+        params = pc_command.get("params", {})
+        query = params.get("query") if isinstance(params, dict) else None
+        if query:
+            result["pc_command"] = None
+            return str(query).strip()
+
+    if isinstance(pc_command, dict) and pc_command.get("action") == "open_url":
+        params = pc_command.get("params", {})
+        url = params.get("url") if isinstance(params, dict) else None
+        if url:
+            query = extract_search_query_from_url(str(url))
+            if query:
+                result["pc_command"] = None
+                return query
+
+    if should_force_web_search(user_text, result):
+        result["pc_command"] = None
+        return user_text.strip()
+
+    return None
+
+
+async def handle_ai_result(client_id: str, user_text: str, result: dict, history: list[dict]) -> None:
+    """Handle LLM output: background web search, PC command, and spoken reply."""
+    query = get_web_search_query(result, user_text)
+    if query:
+        print(f"[WebSearch] query={query}")
+        await send_json_to_esp32(client_id, {
+            "type": "status",
+            "msg": f"正在联网查询：{query}"
+        })
+        results = await search_web(query)
+        if not results:
+            reply = "我刚才没查到可靠结果，可以换个关键词再问我一次。"
+        else:
+            search_context = format_search_results(query, results)
+            reply = await answer_with_search_results(user_text, query, search_context, history)
+            if not reply:
+                reply = "我查到了结果，但暂时没能整理成回答。"
+
+        await send_tts_stream_to_esp32(client_id, reply)
+        return
+
+    reply = result.get("reply", "")
+    pc_command = result.get("pc_command")
+    print(f"[LLM] reply={reply}, pc_cmd={pc_command}")
+
+    if pc_command:
+        sent = await send_pc_command(pc_command, client_id)
+        if not sent:
+            await send_json_to_esp32(client_id, {
+                "type": "status",
+                "msg": "没有在线 PC Agent，无法执行电脑控制命令"
+            })
+
+    if reply:
+        await send_tts_stream_to_esp32(client_id, reply)
+
+
 @app.websocket("/ws/esp32")
 async def esp32_endpoint(websocket: WebSocket):
     """
@@ -161,20 +283,7 @@ async def esp32_endpoint(websocket: WebSocket):
                     print(f"[Text] {text}")
 
                     result = await chat(text, history)
-                    reply = result.get("reply", "")
-                    pc_command = result.get("pc_command")
-                    print(f"[LLM] reply={reply}, pc_cmd={pc_command}")
-
-                    if pc_command:
-                        sent = await send_pc_command(pc_command, client_id)
-                        if not sent:
-                            await send_json_to_esp32(client_id, {
-                                "type": "status",
-                                "msg": "没有在线 PC Agent，无法执行电脑控制命令"
-                            })
-
-                    if reply:
-                        await send_tts_stream_to_esp32(client_id, reply)
+                    await handle_ai_result(client_id, text, result, history)
 
                 # ========== 语音模式（正式流程：STT -> LLM -> TTS）==========
                 elif data.get("type") == "audio":
@@ -202,22 +311,7 @@ async def esp32_endpoint(websocket: WebSocket):
                     })
 
                     result = await chat(text, history)
-                    reply = result.get("reply", "")
-                    pc_command = result.get("pc_command")
-                    print(f"[LLM] reply={reply}, pc_cmd={pc_command}")
-
-                    if pc_command:
-                        sent = await send_pc_command(pc_command, client_id)
-                        if sent:
-                            print(f"[PC Agent] 已发送命令: {pc_command}")
-                        else:
-                            await send_json_to_esp32(client_id, {
-                                "type": "status",
-                                "msg": "没有在线 PC Agent，无法执行电脑控制命令"
-                            })
-
-                    if reply:
-                        await send_tts_stream_to_esp32(client_id, reply)
+                    await handle_ai_result(client_id, text, result, history)
 
                 # ========== 心跳 ==========
                 elif data.get("type") == "ping":
@@ -305,6 +399,7 @@ async def health():
 if __name__ == "__main__":
     import uvicorn
     # 启动 WebSocket 服务，默认监听 0.0.0.0:8000
+    print(f"[ESPAgent] version={APP_VERSION}")
     uvicorn.run(
         app,
         host=SERVER_HOST,

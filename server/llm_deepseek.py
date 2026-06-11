@@ -23,29 +23,31 @@ client = AsyncOpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
 SYSTEM_PROMPT = """你是一个智能枕头助手，用户躺在床上通过语音和你对话。
 
 核心原则：
-- 用户问任何需要实时信息的问题（天气、金价、新闻、股票等），直接用 search 命令帮他搜索，不要说"我查不到"。
-- 用户说"帮我搜一下"但没说具体内容时，结合上下文推断搜索词。
+- 用户问任何需要实时信息的问题（天气、金价、新闻、股票、比赛、政策等），使用 web_search，让服务端后台联网查询并总结，不要打开浏览器。
+- 用户说"帮我查一下/搜一下/了解一下"时，如果只是想知道答案，也使用 web_search。
+- 只有用户明确说"打开网页/打开浏览器/用浏览器搜索/打开文件"时，才使用 pc_command 控制电脑。
 - 回复简短友好，控制在 30 字以内，像朋友聊天。
 
 回复格式必须是 JSON：
-{"reply": "语音回复", "pc_command": null 或 {"action": "动作名", "params": {...}}}
+{"reply": "语音回复", "web_search": null 或 {"query": "搜索词"}, "pc_command": null 或 {"action": "动作名", "params": {...}}}
 
 支持的 pc_command action：
-- "search": 搜索资料并返回结果，params: {"query": "搜索词"}
 - "open_url": 打开指定网页，params: {"url": "网址"}
 - "open_file": 打开本地文件，params: {"path": "文件路径"}
 - "summarize_file": 读取并汇总文件，params: {"path": "文件路径"}
 
 判断规则：
-1. 用户问实时信息（天气、价格、新闻、比分等）→ 必须用 search
-2. 用户明确说"搜/查/找/看看"→ 用 search
+1. 用户问实时信息（天气、价格、新闻、比分等）→ 必须用 web_search
+2. 用户明确说"搜/查/找/看看"，但没有要求打开浏览器 → 用 web_search
 3. 用户说"打开百度/打开B站"等 → 用 open_url
-4. 纯闲聊（你好、晚安、讲个笑话）→ pc_command 为 null
+4. 用户明确说"用浏览器搜索 xxx" → 用 pc_command open_url 打开搜索页面
+5. 纯闲聊（你好、晚安、讲个笑话）→ web_search 和 pc_command 都为 null
 
 示例：
-用户："今天金价多少" → {"reply": "帮你查一下今天的金价", "pc_command": {"action": "search", "params": {"query": "今天黄金价格"}}}
-用户："帮我搜一下"（上文聊到睡眠）→ {"reply": "好的，帮你搜索睡眠相关资料", "pc_command": {"action": "search", "params": {"query": "改善睡眠质量方法"}}}
-用户："晚安" → {"reply": "晚安，祝你睡个好觉", "pc_command": null}
+用户："今天金价多少" → {"reply": "我查一下最新金价", "web_search": {"query": "今天黄金价格 最新"}, "pc_command": null}
+用户："重庆天气" → {"reply": "我查一下重庆天气", "web_search": {"query": "重庆天气 今天"}, "pc_command": null}
+用户："用浏览器搜索 ESP32" → {"reply": "好的，帮你打开搜索页面", "web_search": null, "pc_command": {"action": "open_url", "params": {"url": "https://www.bing.com/search?q=ESP32"}}}
+用户："晚安" → {"reply": "晚安，祝你睡个好觉", "web_search": null, "pc_command": null}
 """
 
 MAX_HISTORY_MESSAGES = 20
@@ -148,3 +150,48 @@ async def chat(user_text: str, history: list[dict] | None = None) -> dict:
         result = {"reply": assistant_msg, "pc_command": None}
 
     return result
+
+
+async def answer_with_search_results(
+    user_text: str,
+    query: str,
+    search_context: str,
+    history: list[dict] | None = None,
+) -> str:
+    """Use DeepSeek to summarize web search results into a short spoken answer."""
+    if history is None:
+        history = []
+
+    prompt = f"""用户问题：{user_text}
+搜索词：{query}
+
+下面是服务端刚刚联网检索到的结果。请只基于这些结果回答，适合语音播报，控制在 120 字以内。
+如果结果里没有明确答案，就说明暂时没查到可靠结论，并建议用户换个问法。
+
+{search_context}
+"""
+
+    stream = await client.chat.completions.create(
+        model=DEEPSEEK_MODEL,
+        messages=[
+            {"role": "system", "content": "你是联网搜索结果总结助手。回答要短、自然、适合语音播报，不要编造搜索结果中没有的信息。"},
+            *history[-MAX_HISTORY_MESSAGES:],
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.3,
+        max_tokens=300,
+        stream=True,
+    )
+
+    parts: list[str] = []
+    async for chunk in stream:
+        delta = chunk.choices[0].delta.content or ""
+        if delta:
+            parts.append(delta)
+
+    answer = "".join(parts).strip()
+    if answer:
+        history.append({"role": "assistant", "content": answer})
+        if len(history) > MAX_HISTORY_MESSAGES:
+            history[:] = history[-MAX_HISTORY_MESSAGES:]
+    return answer

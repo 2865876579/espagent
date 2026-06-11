@@ -68,6 +68,12 @@ try:
 except Exception as e:
     print(f"[FAIL] stt_xunfei: {e}")
 
+try:
+    from web_search import search_web
+    print("[OK] web_search")
+except Exception as e:
+    print(f"[FAIL] web_search: {e}")
+
 print()
 print("=" * 40)
 print("如果上面全是 [OK]，运行: python main.py")
