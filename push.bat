@@ -6,6 +6,9 @@ if /i "%~1" neq "--run" (
   exit /b
 )
 
+set "NO_PAUSE=0"
+if /i "%~2"=="--nopause" set "NO_PAUSE=1"
+
 cd /d "%~dp0"
 
 echo ==============================
@@ -25,23 +28,23 @@ git diff --cached --quiet
 if %errorlevel% equ 0 (
   echo No staged changes to commit.
   git status --short
-  pause
+  if "%NO_PAUSE%" neq "1" pause
   exit /b 0
 )
 
 git commit -m "auto backup %NOW%"
 if errorlevel 1 (
   echo Commit failed.
-  pause
+  if "%NO_PAUSE%" neq "1" pause
   exit /b 1
 )
 
 git push
 if errorlevel 1 (
   echo Push failed.
-  pause
+  if "%NO_PAUSE%" neq "1" pause
   exit /b 1
 )
 
 echo Done.
-pause
+if "%NO_PAUSE%" neq "1" pause
