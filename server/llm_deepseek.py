@@ -1,207 +1,136 @@
 """
-DeepSeek LLM 对话模块
+DeepSeek 对话模块 —— 基于 Function Calling
 
-功能：
-  1. 接收用户文字，调用 DeepSeek API 生成回复
-  2. 通过 System Prompt 约束输出格式为 JSON
-  3. JSON 包含两部分：
-     - reply: 要通过 TTS 说给用户听的话
-     - pc_command: 如果用户想控制电脑，返回结构化命令；否则为 null
+架构：
+  用户输入 → chat() → DeepSeek（带工具定义）→ 模型决策调哪个工具 → 执行 → 回传结果 → 最终回复
 
-DeepSeek API 兼容 OpenAI 格式，直接用 openai 库调用。
-注册地址：https://platform.deepseek.com/
+工具扩展方法：
+  1. 在 TOOLS 列表里新增一个工具定义（name/description/parameters）
+  2. 在 _dispatch_tool() 里加对应的 elif 分支处理逻辑
+  3. chat() 主循环不需要动
 """
 import json
-from json import JSONDecodeError
 from openai import AsyncOpenAI
 from config import DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_MODEL
+from web_search import search_web, format_search_results, direct_answer_from_results
 
-# DeepSeek 客户端，兼容 OpenAI SDK 格式
 client = AsyncOpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
 
-# 系统提示词：约束 LLM 的输出格式和行为
-SYSTEM_PROMPT = """你是"小眠"，一个陪伴在用户枕头里的睡眠健康助手。用户躺在床上通过语音和你聊天。
+# ── 系统提示词 ──────────────────────────────────────────────
+SYSTEM_PROMPT = """你是"小眠"，住在用户枕头里的睡眠陪伴助手。用户躺在床上和你说话。
 
-== 性格 ==
-- 温柔、耐心，像深夜电台里让人安心的声音
-- 懂睡眠医学和健康知识，但不用术语压人，用聊天的方式讲清楚
-- 偶尔带点小幽默，自然不刻意
-- 回复像朋友：该短就短（晚安回"晚安~好梦"），需要解释就好好说（问"什么是睡眠呼吸暂停"可以多说几句）
-- 永远用中文回复
+性格：
+- 温柔、有点小俏皮，像深夜陪你聊天的朋友
+- 懂睡眠和健康，但说人话，不堆术语
+- 回复要短：晚安就回"晚安～好梦"，需要解释才多说几句
+- 只说中文，语气自然，偶尔带点关心
 
-== 能力 ==
-
-1. 直接回答（默认）
-   常识、建议、闲聊、情感陪伴——直接聊，不用任何工具。
-
-2. 联网搜索
-   只有需要实时信息时：天气、金价、新闻、股票、比赛、政策、价格、汇率等。后台会帮你搜，你只需要在 web_search 里填搜索词。
-
-3. 控制电脑
-   用户明确说"打开XX网页/用浏览器搜索/打开文件"时用 pc_command。
-   action: "open_url" → {"url": "..."}
-   action: "open_file" → {"path": "..."}
-   action: "summarize_file" → {"path": "..."}
-
-4. 限制
-   邮件、微信等私有内容不能直接读。自然告诉用户怎么帮你（发文本、给文件路径），不反复追问。
-
-== 输出格式 ==
-只输出一行 JSON：
-{"reply": "语音回复内容", "web_search": null, "pc_command": null}
-web_search 非空时：{"query": "搜索词"}
-pc_command 非空时：{"action": "open_url", "params": {"url": "..."}}
-
-== 示例 ==
-用户："今天金价" → {"reply": "帮你查一下最新金价~", "web_search": {"query": "今天黄金价格"}, "pc_command": null}
-用户："什么是ESP32" → {"reply": "ESP32是一款带Wi-Fi和蓝牙的低功耗芯片，很多智能家居设备都在用它~", "web_search": null, "pc_command": null}
-用户："怎么睡得好一点" → {"reply": "睡前半小时放下手机，房间凉爽安静，试试白噪音。坚持一周就能感觉到变化~", "web_search": null, "pc_command": null}
-用户："晚安" → {"reply": "晚安，做个好梦~", "web_search": null, "pc_command": null}
-用户："帮我打开B站" → {"reply": "好的~", "web_search": null, "pc_command": {"action": "open_url", "params": {"url": "https://www.bilibili.com"}}}
+能力：
+- 需要实时信息时（天气、新闻、金价、股票、赛事等），主动调用 web_search 工具联网查询，不要凭记忆瞎猜
+- 查到结果后用自然语气播报，控制在 100 字以内，适合语音收听
 """
 
-MAX_HISTORY_MESSAGES = 20
+# ── 工具定义 ────────────────────────────────────────────────
+# 每个工具对应一个真实能力，description 要让模型能准确判断何时调用
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": (
+                "联网搜索实时信息。适用于：天气、气温、新闻、热点、金价、股票、"
+                "汇率、油价、赛事比分、航班、政策等需要最新数据的问题。"
+                "不确定信息是否实时时，优先调用此工具而不是凭记忆回答。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "搜索关键词，尽量简洁，如『北京天气』、『今日黄金价格』",
+                    }
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    # 后续在这里追加更多工具：pc_command、device_control 等
+]
+
+MAX_HISTORY = 20   # 保留最近 N 条消息，避免 token 超限
+MAX_TURNS = 5      # 单次请求最多允许模型连续调用工具的轮数，防止死循环
 
 
-def _parse_json_reply(text: str) -> dict | None:
-    """从模型输出中提取完整 JSON 对象；未完整时返回 None。"""
-    candidate = text.strip()
-    if not candidate:
-        return None
+async def _dispatch_tool(name: str, arguments: dict) -> str:
+    """
+    执行模型请求的工具调用，返回结果字符串给模型。
 
-    if candidate.startswith("```"):
-        lines = candidate.splitlines()
-        if len(lines) >= 3 and lines[-1].strip().startswith("```"):
-            candidate = "\n".join(lines[1:-1]).strip()
+    扩展：加新工具时在这里加 elif 分支即可，chat() 不需要动。
+    """
+    if name == "web_search":
+        query = arguments.get("query", "")
+        results = await search_web(query)
+        if not results:
+            return "没有搜到可靠结果。"
+        # 优先用结构化直接答案（天气/金价/新闻），否则返回摘要文本供模型总结
+        direct = direct_answer_from_results(query, results)
+        return direct if direct else format_search_results(query, results)
 
-    json_start = candidate.find("{")
-    if json_start > 0:
-        candidate = candidate[json_start:]
-
-    decoder = json.JSONDecoder()
-    try:
-        result, end = decoder.raw_decode(candidate)
-    except JSONDecodeError:
-        return None
-
-    tail = candidate[end:].strip()
-    if tail and not tail.startswith("```"):
-        return None
-    if not isinstance(result, dict):
-        return None
-    return result
-
-
-async def _close_stream(stream) -> None:
-    close = getattr(stream, "close", None) or getattr(stream, "aclose", None)
-    if close is None:
-        return
-    maybe_awaitable = close()
-    if hasattr(maybe_awaitable, "__await__"):
-        await maybe_awaitable
+    # 后续在此处添加更多工具，例如：
+    # elif name == "pc_command":
+    #     ...
+    return f"工具 {name} 暂未实现"
 
 
 async def chat(user_text: str, history: list[dict] | None = None) -> dict:
     """
-    与 DeepSeek LLM 对话
+    与 DeepSeek 对话，支持 Function Calling 多轮工具调用。
 
-    参数：
-      user_text: 用户说的话（STT 识别结果或直接输入的文字）
-
-    返回：
-      dict，格式为 {"reply": "回复文字", "pc_command": null 或 命令对象}
-
-    如果 LLM 返回的不是合法 JSON（偶尔会发生），
-    会把整个回复当作 reply，pc_command 设为 null。
+    返回：{"reply": "回复文字", "pc_command": None}
+    pc_command 字段保留是为了兼容 main.py 现有逻辑，后续工具接入后会用到。
     """
     if history is None:
         history = []
 
-    # 追加用户消息到当前连接的历史
     history.append({"role": "user", "content": user_text})
+    if len(history) > MAX_HISTORY:
+        history[:] = history[-MAX_HISTORY:]
 
-    # 只保留最近 20 轮对话，避免 token 超限
-    if len(history) > MAX_HISTORY_MESSAGES:
-        history[:] = history[-MAX_HISTORY_MESSAGES:]
+    # Agent 循环：模型可能连续调用多个工具，直到给出最终回复
+    for _ in range(MAX_TURNS):
+        kwargs = dict(
+            model=DEEPSEEK_MODEL,
+            messages=[{"role": "system", "content": SYSTEM_PROMPT}] + history,
+            max_tokens=1024,
+        )
+        # 只在有工具时传 tools 参数，避免空列表触发不必要的行为
+        if TOOLS:
+            kwargs["tools"] = TOOLS
 
-    # 流式调用 DeepSeek API，尽早拼出完整 JSON 后立即返回。
-    stream = await client.chat.completions.create(
-        model=DEEPSEEK_MODEL,
-        messages=[{"role": "system", "content": SYSTEM_PROMPT}] + history,
-        max_tokens=1024,   # reasoner 推理过程也消耗 token，要给足空间
-        stream=True,
-    )
+        response = await client.chat.completions.create(**kwargs)
+        msg = response.choices[0].message
 
-    parts: list[str] = []
-    async for chunk in stream:
-        delta = chunk.choices[0].delta.content or ""
-        if not delta:
-            continue
+        # 模型请求调用工具
+        if msg.tool_calls:
+            history.append(msg)  # 把模型的工具调用意图存入历史
+            for tc in msg.tool_calls:
+                args = json.loads(tc.function.arguments)
+                result = await _dispatch_tool(tc.function.name, args)
+                # 把工具执行结果回传给模型
+                history.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": result,
+                })
+            continue  # 让模型根据工具结果继续生成
 
-        parts.append(delta)
-        assistant_msg = "".join(parts).strip()
-        result = _parse_json_reply(assistant_msg)
-        if result is not None:
-            history.append({"role": "assistant", "content": assistant_msg})
-            if len(history) > MAX_HISTORY_MESSAGES:
-                history[:] = history[-MAX_HISTORY_MESSAGES:]
-            await _close_stream(stream)
-            return result
+        # 模型给出最终文字回复
+        reply = (msg.content or "").strip()
+        history.append({"role": "assistant", "content": reply})
+        if len(history) > MAX_HISTORY:
+            history[:] = history[-MAX_HISTORY:]
 
-    assistant_msg = "".join(parts).strip()
-    history.append({"role": "assistant", "content": assistant_msg})
-    if len(history) > MAX_HISTORY_MESSAGES:
-        history[:] = history[-MAX_HISTORY_MESSAGES:]
+        return {"reply": reply, "pc_command": None}
 
-    # 如果整段流式输出结束后仍不是合法 JSON，兜底成普通回复。
-    result = _parse_json_reply(assistant_msg)
-    if result is None:
-        result = {"reply": assistant_msg, "pc_command": None}
-
-    return result
-
-
-async def answer_with_search_results(
-    user_text: str,
-    query: str,
-    search_context: str,
-    history: list[dict] | None = None,
-) -> str:
-    """Use DeepSeek to summarize web search results into a short spoken answer."""
-    if history is None:
-        history = []
-
-    prompt = f"""用户问题：{user_text}
-搜索词：{query}
-
-下面是服务端刚刚联网检索到的结果。请只基于这些结果回答，适合语音播报，控制在 120 字以内。
-只要结果里有相关信息，就给出最佳答案，并自然说明来源或时间。
-不要轻易说"没查到"；只有搜索结果明显无关或完全没有可用信息时，才说明暂时没查到可靠结论。
-如果是价格、天气、新闻、行情类问题，优先提取数字、状态、时间和来源限制。
-
-{search_context}
-"""
-
-    stream = await client.chat.completions.create(
-        model=DEEPSEEK_MODEL,
-        messages=[
-            {"role": "system", "content": "你是联网搜索结果总结助手。回答要短、自然、适合语音播报。基于结果尽量给出有用答案，不要编造结果中没有的信息。"},
-            *history[-MAX_HISTORY_MESSAGES:],
-            {"role": "user", "content": prompt},
-        ],
-        max_tokens=512,
-        stream=True,
-    )
-
-    parts: list[str] = []
-    async for chunk in stream:
-        delta = chunk.choices[0].delta.content or ""
-        if delta:
-            parts.append(delta)
-
-    answer = "".join(parts).strip()
-    if answer:
-        history.append({"role": "assistant", "content": answer})
-        if len(history) > MAX_HISTORY_MESSAGES:
-            history[:] = history[-MAX_HISTORY_MESSAGES:]
-    return answer
+    # 超过最大轮数兜底
+    return {"reply": "抱歉，我刚才有点转不过来，能再说一遍吗？", "pc_command": None}

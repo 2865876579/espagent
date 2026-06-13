@@ -15,18 +15,25 @@ WebSocket 端点：
   /ws/pc_agent  - PC Agent 连接入口
   /health       - HTTP 健康检查
 """
+import sys
 import json
 import asyncio
 import base64
 import re
+
+# Windows 控制台默认 GBK，强制 UTF-8 避免 emoji 打印崩溃
+if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if sys.stderr.encoding and sys.stderr.encoding.lower() != "utf-8":
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 import time
 import urllib.parse
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from config import SERVER_HOST, SERVER_PORT
 from stt_xunfei import recognize
-from llm_deepseek import answer_with_search_results, chat
+from llm_deepseek import chat
 from tts_edge import synthesize
-from web_search import direct_answer_from_results, format_search_results, search_web
+from web_search import direct_answer_from_results, format_search_results, search_web  # 搜索工具，供后续 function calling 工具接入时使用
 
 app = FastAPI(title="Smart Pillow Cloud Server")
 APP_VERSION = "search_intent_interrupt_v4"
@@ -41,16 +48,6 @@ esp32_send_locks: dict[str, asyncio.Lock] = {}
 esp32_sessions: dict[str, dict] = {}
 pc_command_contexts: dict[str, dict] = {}
 last_active_esp32_id: str | None = None
-
-REALTIME_KEYWORDS = (
-    "天气", "气温", "金价", "黄金", "新闻", "大事", "时事", "热点", "热搜",
-    "股票", "股价", "汇率", "油价", "行情", "比分", "赛程"
-)
-REALTIME_TIME_WORDS = ("今天", "今日", "现在", "最新", "最近")
-REALTIME_SUBJECT_WORDS = (
-    "新闻", "大事", "发生", "事件", "热点", "热搜", "金价", "黄金", "天气", "气温",
-    "股票", "股价", "汇率", "油价", "价格", "行情", "比分", "赛程", "政策", "航班"
-)
 
 
 async def send_json_to_esp32(client_id: str, payload: dict) -> bool:
@@ -212,90 +209,9 @@ def extract_search_query_from_url(url: str) -> str | None:
     return None
 
 
-def should_force_web_search(user_text: str, result: dict) -> bool:
-    """Fallback for realtime/search questions when the model does not emit web_search."""
-    if any(keyword in user_text for keyword in REALTIME_KEYWORDS):
-        return True
-    if (
-        any(word in user_text for word in REALTIME_TIME_WORDS)
-        and any(word in user_text for word in REALTIME_SUBJECT_WORDS)
-    ):
-        return True
-    if re.search(r"(有什么|发生了什么).*(新闻|大事|热点|热搜|事件)", user_text):
-        return True
-
-    reply = str(result.get("reply", ""))
-    if any(word in reply for word in ("正在帮你搜索", "帮你搜索", "帮你查", "查一下")):
-        return True
-
-    return False
-
-
-def get_web_search_query(result: dict, user_text: str) -> str | None:
-    """Extract the background web-search query from new or legacy LLM output."""
-    web_search = result.get("web_search")
-    if isinstance(web_search, dict):
-        query = web_search.get("query")
-        if query:
-            return str(query).strip()
-    elif isinstance(web_search, str) and web_search.strip():
-        return web_search.strip()
-
-    # Backward compatibility: older prompts used pc_command.search.
-    pc_command = result.get("pc_command")
-    if isinstance(pc_command, dict) and pc_command.get("action") == "search":
-        params = pc_command.get("params", {})
-        query = params.get("query") if isinstance(params, dict) else None
-        if query:
-            result["pc_command"] = None
-            return str(query).strip()
-
-    if isinstance(pc_command, dict) and pc_command.get("action") == "open_url":
-        params = pc_command.get("params", {})
-        url = params.get("url") if isinstance(params, dict) else None
-        if url:
-            query = extract_search_query_from_url(str(url))
-            if query:
-                result["pc_command"] = None
-                return query
-
-    if should_force_web_search(user_text, result):
-        result["pc_command"] = None
-        return user_text.strip()
-
-    return None
-
 
 async def handle_ai_result(client_id: str, user_text: str, result: dict, history: list[dict], turn_id: int) -> None:
-    """Handle LLM output: background web search, PC command, and spoken reply."""
-    if not is_current_turn(client_id, turn_id):
-        return
-
-    query = get_web_search_query(result, user_text)
-    if query:
-        print(f"[WebSearch] query={query}")
-        await send_json_to_esp32(client_id, {
-            "type": "status",
-            "msg": f"正在联网查询：{query}"
-        })
-        results = await search_web(query)
-        if not is_current_turn(client_id, turn_id):
-            return
-        if not results:
-            reply = "我刚才没查到可靠结果，可以换个关键词再问我一次。"
-        else:
-            reply = direct_answer_from_results(query, results)
-            if not reply:
-                search_context = format_search_results(query, results)
-                reply = await answer_with_search_results(user_text, query, search_context, history)
-                if not is_current_turn(client_id, turn_id):
-                    return
-                if not reply:
-                    reply = "我查到了结果，但暂时没能整理成回答。"
-
-        await send_tts_stream_to_esp32(client_id, reply, turn_id=turn_id)
-        return
-
+    """处理 LLM 返回结果：执行 pc_command（如有），播报语音回复。"""
     if not is_current_turn(client_id, turn_id):
         return
 
